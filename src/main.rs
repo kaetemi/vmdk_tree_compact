@@ -3,6 +3,9 @@
 //! every file is opened read-only and read with positioned reads.
 
 mod analysis;
+// Not wired into the CLI yet.
+#[cfg_attr(not(test), allow(dead_code))]
+mod compact;
 mod descriptor;
 mod io;
 mod layer;

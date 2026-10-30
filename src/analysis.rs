@@ -200,6 +200,14 @@ impl Bitset {
 		self.words.iter().zip(&o.words).all(|(a, b)| a & !b == 0)
 	}
 
+	/// Bits `[start, start + len)` as a new bitset indexed from 0.
+	pub fn slice(&self, start: usize, len: usize) -> Bitset {
+		assert!(start + len <= self.len, "slice {start}+{len} out of range {}", self.len);
+		let mut b = Bitset::new(len);
+		(0..len).filter(|&i| self.get(start + i)).for_each(|i| b.set(i));
+		b
+	}
+
 	pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
 		self.words.iter().enumerate().flat_map(|(wi, &w)| {
 			let mut w = w;

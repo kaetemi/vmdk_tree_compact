@@ -138,6 +138,11 @@ impl Layer {
 		&self.extents[i]
 	}
 
+	/// Grain table entries of the whole layer, indexed by global grain.
+	pub fn gtes(&self) -> &[u32] {
+		&self.gtes
+	}
+
 	/// Reads part of grain `g`, which must be allocated in this layer.
 	pub fn read_grain(&self, g: u64, within: u64, buf: &mut [u8]) -> Result<()> {
 		let e = self.gte(g);

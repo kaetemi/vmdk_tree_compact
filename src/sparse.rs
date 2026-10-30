@@ -275,6 +275,26 @@ impl SparseExtent {
 		);
 		self.file.read_full_at(sector * SECTOR_SIZE, buf).with_context(|| format!("reading grain data from {}", self.path.display()))
 	}
+
+	/// Reads raw bytes anywhere inside the file, metadata included.
+	pub fn read_raw(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+		ensure!(
+			offset.checked_add(buf.len() as u64).is_some_and(|end| end <= self.file_len),
+			"read of {} bytes at offset {offset} extends past the end of {}",
+			buf.len(),
+			self.path.display()
+		);
+		self.file.read_full_at(offset, buf).with_context(|| format!("reading {}", self.path.display()))
+	}
+
+	/// The whole metadata area `[0, overHead)`: header, grain directories, grain tables and padding.
+	pub fn read_metadata(&self) -> Result<Vec<u8>> {
+		let len = self.header.overhead * SECTOR_SIZE;
+		ensure!(len <= self.file_len, "overHead ({len} bytes) extends past the end of {} ({} bytes)", self.path.display(), self.file_len);
+		let mut v = vec![0u8; len as usize];
+		self.read_raw(0, &mut v)?;
+		Ok(v)
+	}
 }
 
 #[cfg(test)]
