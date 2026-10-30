@@ -370,6 +370,7 @@ impl LayerPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
 	Untouched,
+	Writing,
 	Written,
 	Verified,
 	OriginalMoved,
@@ -382,6 +383,7 @@ impl Stage {
 	fn describe(self) -> &'static str {
 		match self {
 			Stage::Untouched => "original untouched; no compacted copy",
+			Stage::Writing => "original untouched; .compact being written when it stopped (partial, NOT verified)",
 			Stage::Written => "original untouched; .compact written but NOT verified",
 			Stage::Verified => "original untouched; .compact written and verified",
 			Stage::OriginalMoved => "original renamed to .old; .compact not yet renamed into place",
@@ -450,6 +452,7 @@ pub fn compact_layer(
 			x.orig_len
 		);
 		let reclaim = plan.reclaim.slice(range.start, range.len());
+		stages[i] = Stage::Writing;
 		let w = write_extent(&orig, &reclaim, &out).with_context(|| format!("writing {}", out.display()))?;
 		stages[i] = Stage::Written;
 		ensure!(
@@ -1385,6 +1388,24 @@ pub(crate) mod tests {
 			assert!(state.contains("written and verified") && state.contains("NOT verified"), "{state}");
 			std::fs::remove_dir_all(&dir).unwrap();
 		}
+	}
+
+	#[test]
+	fn existing_compact_file_is_never_overwritten() {
+		let dir = build_vm("exists", 61);
+		let t = Tree::load(&dir).unwrap();
+		let reclaim = analyze_fake(&t, &fake_free(&t, &mut Rng(62)));
+		let plan = LayerPlan::new(&t, t.root, 0, &reclaim[t.root], true).unwrap();
+		drop(t);
+		std::fs::write(dir.join("t-s002.vmdk.compact"), b"someone else's").unwrap();
+		let before = files(&dir);
+		let mut stages = vec![Stage::Untouched; plan.extents.len()];
+		assert!(compact_layer(&dir, &plan, false, &mut stages, &mut |_, _| Ok(())).is_err());
+		assert_eq!(stages, [Stage::Verified, Stage::Writing]);
+		let after = files(&dir);
+		assert!(before.iter().all(|(k, v)| after.get(k) == Some(v)));
+		assert!(describe_state(&dir, &plan, &stages).contains("being written"));
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
 	#[test]
