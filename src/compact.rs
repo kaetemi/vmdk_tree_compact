@@ -2,19 +2,25 @@
 //! state still needs, verifies every rewritten extent against its original, and swaps it in.
 //! Descriptors, `.vmsd`, `.vmx` and `.vmsn` files are never touched, so CID/parentCID stay as they are.
 
-use crate::analysis::Bitset;
+use crate::analysis::{self, Bitset};
 use crate::io::le32;
+use crate::ntfs::{self, BootSector, NodeFs};
+use crate::partition::{Partition, Scheme};
+use crate::report::{self, size, Table};
 use crate::sparse::{SparseExtent, SparseHeader, FLAG_REDUNDANT_GT, GTE_ZERO_GRAIN, SECTOR_SIZE};
 use crate::tree::Tree;
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub const COMPACT_SUFFIX: &str = ".compact";
 pub const OLD_SUFFIX: &str = ".old";
+/// Free space kept in reserve on the target volume.
+pub const MARGIN: u64 = 1 << 30;
 /// Byte offset of `uncleanShutdown` in the sparse extent header.
 const UNCLEAN_SHUTDOWN_AT: usize = 72;
 /// Grain data is copied and compared in batches of at most this many bytes.
@@ -457,7 +463,7 @@ pub fn compact_layer(
 		);
 		after_write(i, &out)?;
 		let v = verify_extent(&orig, &reclaim, &out).with_context(|| format!("verifying {}", out.display()))?;
-		ensure!(v.gtes == w.gtes && v.len == w.len, "{}: verified grain tables differ from the ones written", out.display());
+		ensure!(v.gtes == w.gtes && v.len == w.len && v.data_grains == w.data_grains, "{}: verified grain tables differ from the ones written", out.display());
 		stages[i] = Stage::Verified;
 		eprintln!("    {}: {} -> {} bytes, {} grains dropped, verified", x.file, x.orig_len, x.new_len, x.dropped_data);
 		verified.push(v);
@@ -518,6 +524,570 @@ pub fn describe_state(dir: &Path, plan: &LayerPlan, stages: &[Stage]) -> String 
 		writeln!(s, "  {:<w$}  {}; on disk: {present}", x.file, st.describe()).unwrap();
 	}
 	s
+}
+
+/// Bytes available to the caller on the volume holding `dir`.
+#[cfg(windows)]
+pub fn free_space(dir: &Path) -> Result<u64> {
+	use std::os::windows::ffi::OsStrExt;
+	#[link(name = "kernel32")]
+	extern "system" {
+		fn GetDiskFreeSpaceExW(directory: *const u16, available: *mut u64, total: *mut u64, total_free: *mut u64) -> i32;
+	}
+	let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+	let (mut available, mut total, mut total_free) = (0u64, 0u64, 0u64);
+	// SAFETY: `wide` is NUL-terminated and outlives the call; the out pointers are valid ULARGE_INTEGERs.
+	let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free) };
+	if ok == 0 {
+		return Err(std::io::Error::last_os_error()).with_context(|| format!("querying free space for {}", dir.display()));
+	}
+	Ok(available)
+}
+
+/// Bytes available to the caller on the volume holding `dir`.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+pub fn free_space(dir: &Path) -> Result<u64> {
+	use std::os::unix::ffi::OsStrExt;
+	/// The leading fields of `struct statvfs` on 64-bit Linux (glibc and musl); the rest is room to spare.
+	#[repr(C)]
+	struct StatVfs {
+		bsize: u64,
+		frsize: u64,
+		blocks: u64,
+		bfree: u64,
+		bavail: u64,
+		rest: [u64; 16],
+	}
+	extern "C" {
+		fn statvfs(path: *const std::ffi::c_char, buf: *mut StatVfs) -> std::ffi::c_int;
+	}
+	let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).context("path contains a NUL byte")?;
+	let mut s = StatVfs { bsize: 0, frsize: 0, blocks: 0, bfree: 0, bavail: 0, rest: [0; 16] };
+	// SAFETY: `c` is NUL-terminated; `s` is larger than the C struct.
+	if unsafe { statvfs(c.as_ptr(), &mut s) } != 0 {
+		return Err(std::io::Error::last_os_error()).with_context(|| format!("querying free space for {}", dir.display()));
+	}
+	let _ = (s.bsize, s.blocks, s.bfree, s.rest);
+	Ok(s.bavail.saturating_mul(s.frsize))
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_pointer_width = "64"))))]
+pub fn free_space(dir: &Path) -> Result<u64> {
+	bail!("querying free space for {} is not implemented on this platform", dir.display())
+}
+
+/// One NTFS volume as `$Bitmap` and the MFT cross-check saw it.
+#[derive(PartialEq, Eq)]
+pub struct VolumeSummary {
+	pub offset: u64,
+	pub boot: BootSector,
+	pub ntfs_version: (u8, u8),
+	pub volume_flags: u16,
+	pub state: String,
+	pub mft_has_attribute_list: bool,
+	pub bitmap_data_size: u64,
+	pub used_clusters: u64,
+	pub bitmap: Vec<u8>,
+	pub mft_check: String,
+}
+
+impl VolumeSummary {
+	fn describe(&self) -> String {
+		format!(
+			"offset {}, {:?}, NTFS {}.{}, flags {:#x}, {}, attribute list {}, $Bitmap {} bytes, {} clusters used, MFT check {}",
+			self.offset,
+			self.boot,
+			self.ntfs_version.0,
+			self.ntfs_version.1,
+			self.volume_flags,
+			self.state,
+			self.mft_has_attribute_list,
+			self.bitmap_data_size,
+			self.used_clusters,
+			self.mft_check
+		)
+	}
+}
+
+/// A node's file system as seen through its chain view, compared before and after compaction.
+#[derive(PartialEq, Eq)]
+pub struct FsSummary {
+	pub scheme: Scheme,
+	pub partitions: Vec<(Partition, Option<VolumeSummary>)>,
+	pub free: Bitset,
+	pub warnings: Vec<String>,
+}
+
+impl FsSummary {
+	pub fn of(f: &NodeFs) -> Self {
+		let partitions = f
+			.partitions
+			.iter()
+			.map(|p| {
+				let v = p.volume.as_ref().map(|v| VolumeSummary {
+					offset: v.offset,
+					boot: v.boot.clone(),
+					ntfs_version: v.ntfs_version,
+					volume_flags: v.volume_flags,
+					state: v.state(),
+					mft_has_attribute_list: v.mft_has_attribute_list,
+					bitmap_data_size: v.bitmap_data_size,
+					used_clusters: v.used_clusters,
+					bitmap: v.bitmap.clone(),
+					mft_check: format!("{:?}", v.mft_check),
+				});
+				(p.partition.clone(), v)
+			})
+			.collect();
+		Self { scheme: f.table.scheme, partitions, free: f.free.clone(), warnings: f.warnings.clone() }
+	}
+
+	/// The first difference from `before` to `self`, if any.
+	pub fn difference(&self, before: &Self) -> Option<String> {
+		if self == before {
+			return None;
+		}
+		if self.scheme != before.scheme {
+			return Some(format!("partition scheme {:?} became {:?}", before.scheme, self.scheme));
+		}
+		if self.partitions.len() != before.partitions.len() {
+			return Some(format!("{} partitions became {}", before.partitions.len(), self.partitions.len()));
+		}
+		for ((pb, vb), (pa, va)) in before.partitions.iter().zip(&self.partitions) {
+			if pb != pa {
+				return Some(format!("partition {pb:?} became {pa:?}"));
+			}
+			match (vb, va) {
+				(Some(b), Some(a)) if a != b => {
+					if let Some(i) = (0..b.bitmap.len().min(a.bitmap.len())).find(|&i| a.bitmap[i] != b.bitmap[i]) {
+						return Some(format!("partition {}: $Bitmap byte {i} changed from {:#04x} to {:#04x}", pa.number, b.bitmap[i], a.bitmap[i]));
+					}
+					return Some(format!("partition {}: volume {} became {}", pa.number, b.describe(), a.describe()));
+				}
+				(Some(_), None) | (None, Some(_)) => return Some(format!("partition {}: NTFS volume appeared or disappeared", pa.number)),
+				_ => {}
+			}
+		}
+		if self.free != before.free {
+			return Some(format!("free grains changed from {} to {}", before.free.count(), self.free.count()));
+		}
+		Some(format!("warnings changed from {:?} to {:?}", before.warnings, self.warnings))
+	}
+}
+
+/// What the file system scan contributes per node: free grains, a summary to compare, warnings.
+pub struct NodeScan {
+	pub free: Bitset,
+	pub summary: FsSummary,
+	pub warnings: Vec<String>,
+}
+
+/// Scans every node's NTFS volumes through its chain view.
+pub fn ntfs_scan(t: &Tree) -> Result<Vec<NodeScan>> {
+	let fs = ntfs::scan_tree(t)?;
+	Ok(fs
+		.iter()
+		.enumerate()
+		.map(|(n, f)| NodeScan {
+			free: f.free.clone(),
+			summary: FsSummary::of(f),
+			warnings: f.warnings.iter().map(|w| format!("{} [{}]: {w}", t.nodes[n].layer.file_name, t.label(n))).collect(),
+		})
+		.collect())
+}
+
+fn strip_suffix_ci<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+	let n = name.len().checked_sub(suffix.len())?;
+	(name.is_char_boundary(n) && name[n..].eq_ignore_ascii_case(suffix)).then(|| &name[..n])
+}
+
+/// Names of the `*.compact` and `*.old` entries in `dir`, sorted.
+pub fn find_leftovers(dir: &Path) -> Result<Vec<String>> {
+	let mut v = Vec::new();
+	for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+		let name = entry?.file_name().to_string_lossy().into_owned();
+		if strip_suffix_ci(&name, COMPACT_SUFFIX).is_some() || strip_suffix_ci(&name, OLD_SUFFIX).is_some() {
+			v.push(name);
+		}
+	}
+	v.sort();
+	Ok(v)
+}
+
+/// One step of putting an interrupted layer back into its original state.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Restore {
+	/// A compacted copy that was never swapped in (or whose swap did not complete).
+	DeleteCompact(String),
+	/// An original moved aside; it goes back under its name, replacing the compacted copy there if any.
+	RestoreOld { old: String, target: String, replaces: bool },
+}
+
+impl Restore {
+	pub fn describe(&self) -> String {
+		match self {
+			Restore::DeleteCompact(n) => format!("delete {n}"),
+			Restore::RestoreOld { old, target, replaces: true } => format!("rename {old} -> {target} (replacing the compacted {target})"),
+			Restore::RestoreOld { old, target, replaces: false } => format!("rename {old} -> {target}"),
+		}
+	}
+}
+
+/// Works out how to restore the leftovers; refuses anything it cannot account for.
+pub fn plan_restore(dir: &Path, leftovers: &[String]) -> Result<Vec<Restore>> {
+	let (mut deletes, mut restores) = (Vec::new(), Vec::new());
+	for name in leftovers {
+		if let Some(base) = strip_suffix_ci(name, COMPACT_SUFFIX) {
+			ensure!(base.to_ascii_lowercase().ends_with(".vmdk"), "{name} is not a leftover of this tool; move it out of {} first", dir.display());
+			let (has_base, has_old) = (exists(&dir.join(base))?, exists(&with_suffix(&dir.join(base), OLD_SUFFIX))?);
+			ensure!(has_base || has_old, "{name} is the only copy of {base} (neither {base} nor {base}{OLD_SUFFIX} exists); resolve this by hand");
+			deletes.push(Restore::DeleteCompact(name.clone()));
+		} else if let Some(base) = strip_suffix_ci(name, OLD_SUFFIX) {
+			ensure!(base.to_ascii_lowercase().ends_with(".vmdk"), "{name} is not a leftover of this tool; move it out of {} first", dir.display());
+			SparseExtent::open(&dir.join(name)).with_context(|| format!("{name} does not open as a valid sparse extent; resolve this by hand"))?;
+			restores.push(Restore::RestoreOld { old: name.clone(), target: base.to_string(), replaces: exists(&dir.join(base))? });
+		}
+	}
+	deletes.extend(restores);
+	Ok(deletes)
+}
+
+pub fn apply_restore(dir: &Path, actions: &[Restore]) -> Result<()> {
+	for a in actions {
+		match a {
+			Restore::DeleteCompact(n) => {
+				let p = dir.join(n);
+				fs_retry(&|| format!("deleting {}", p.display()), || std::fs::remove_file(&p))?;
+			}
+			Restore::RestoreOld { old, target, .. } => {
+				let (from, to) = (dir.join(old), dir.join(target));
+				// std::fs::rename replaces `to` atomically if it exists (the compacted copy).
+				fs_retry(&|| format!("renaming {} to {}", from.display(), to.display()), || std::fs::rename(&from, &to))?;
+			}
+		}
+	}
+	sync_dir(dir)
+}
+
+pub struct Options {
+	pub yes: bool,
+	pub keep_originals: bool,
+	pub resume: bool,
+	/// Descriptor file names of the layers to compact; empty means all.
+	pub layers: Vec<String>,
+}
+
+fn resolve_layers(t: &Tree, names: &[String]) -> Result<Vec<bool>> {
+	if names.is_empty() {
+		return Ok(vec![true; t.len()]);
+	}
+	let mut sel = vec![false; t.len()];
+	for name in names {
+		let base = Path::new(name).file_name().map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
+		let n = t.nodes.iter().position(|nd| nd.layer.file_name.eq_ignore_ascii_case(&base)).with_context(|| {
+			let known: Vec<&str> = t.nodes.iter().map(|nd| nd.layer.file_name.as_str()).collect();
+			format!("--layer {name:?} is not a layer descriptor of this VM (layers: {})", known.join(", "))
+		})?;
+		sel[n] = true;
+	}
+	Ok(sel)
+}
+
+struct Space {
+	available: u64,
+	needed: u64,
+	basis: String,
+}
+
+fn space_needed(plans: &[LayerPlan], keep_originals: bool) -> (u64, String) {
+	let writing: Vec<&LayerPlan> = plans.iter().filter(|p| p.will_write()).collect();
+	let Some(largest) = writing.iter().max_by_key(|p| p.new_bytes()) else {
+		return (0, "nothing to write".to_string());
+	};
+	if keep_originals {
+		let sum: u64 = writing.iter().map(|p| p.new_bytes()).sum();
+		(sum + MARGIN, format!("compacted size of all {} layers {} (--keep-originals) + {} margin", writing.len(), size(sum), size(MARGIN)))
+	} else {
+		(
+			largest.new_bytes() + MARGIN,
+			format!("compacted size of the largest layer, {} {} + {} margin", largest.file_name, size(largest.new_bytes()), size(MARGIN)),
+		)
+	}
+}
+
+fn plan_report(t: &Tree, plans: &[LayerPlan], o: &Options, space: &Space, warnings: &[String]) -> String {
+	let gb = t.grain_bytes();
+	let mut s = report::header(t);
+	let mode = if o.yes {
+		"compact (--yes): every layer marked rewrite below is rewritten, verified and replaced"
+	} else {
+		"plan only (no --yes); nothing is written"
+	};
+	writeln!(s, "Mode         : {mode}").unwrap();
+	let originals = if o.keep_originals {
+		"kept as <extent>.old (--keep-originals)"
+	} else {
+		"deleted layer by layer, once its compacted extents are verified and in place"
+	};
+	writeln!(s, "Originals    : {originals}").unwrap();
+	writeln!(s).unwrap();
+	writeln!(s, "Compaction plan per layer (analysis re-run in this process)").unwrap();
+	let mut tab = Table::new(&[
+		("Layer", false),
+		("Snapshot", false),
+		("Extents", true),
+		("Drop grains", true),
+		("On disk now", true),
+		("After", true),
+		("Freed", true),
+		("Freed bytes", true),
+		("Action", false),
+	]);
+	let (mut tg, mut tn, mut ta, mut tf, mut td) = (0u64, 0u64, 0u64, 0u64, 0u64);
+	for p in plans {
+		let (after, action) = match (p.selected, p.will_write()) {
+			(_, true) => (p.new_bytes(), "rewrite"),
+			(false, _) => (p.orig_bytes(), "skip (not selected)"),
+			(true, false) => (p.orig_bytes(), "skip (nothing to drop)"),
+		};
+		let grains = if p.will_write() { p.reclaim_grains() } else { 0 };
+		let freed = p.orig_bytes() - after;
+		tg += grains;
+		td += if p.will_write() { p.extents.iter().map(|x| x.dropped_data).sum::<u64>() } else { 0 };
+		tn += p.orig_bytes();
+		ta += after;
+		tf += freed;
+		tab.row(vec![
+			report::indent_name(p.depth, &p.file_name),
+			p.label.clone(),
+			p.extents.len().to_string(),
+			grains.to_string(),
+			size(p.orig_bytes()),
+			size(after),
+			size(freed),
+			freed.to_string(),
+			action.to_string(),
+		]);
+	}
+	tab.rule();
+	tab.row(vec!["Total".into(), String::new(), String::new(), tg.to_string(), size(tn), size(ta), size(tf), tf.to_string(), String::new()]);
+	s.push_str(&tab.render());
+	writeln!(s).unwrap();
+	writeln!(s, "Exact totals").unwrap();
+	writeln!(s, "  Grains dropped     : {tg} ({td} with data = {} bytes)", td * gb).unwrap();
+	writeln!(s, "  Extent files now   : {tn} bytes").unwrap();
+	writeln!(s, "  Extent files after : {ta} bytes").unwrap();
+	writeln!(s, "  Freed              : {tf} bytes ({})", size(tf)).unwrap();
+	writeln!(s).unwrap();
+	let verdict = if space.available >= space.needed { "OK" } else { "INSUFFICIENT" };
+	writeln!(s, "Free space on the target volume: {} bytes ({})", space.available, size(space.available)).unwrap();
+	writeln!(s, "Needed: {} = {} bytes: {verdict}", space.basis, space.needed).unwrap();
+	writeln!(s).unwrap();
+	writeln!(s, "Checks passed:").unwrap();
+	writeln!(s, "  - no .lck files; every extent opened cleanly (uncleanShutdown clear) and passed the tree validation;").unwrap();
+	writeln!(s, "  - reclaim computed per DESIGN.md and by an independent per-node provider walk: identical;").unwrap();
+	writeln!(s, "  - dropping all reclaimable grains at once leaves every grain in use at any node served by the same layer;").unwrap();
+	writeln!(s, "  - every extent to rewrite has the standard metadata layout (all grain tables present, in order, disjoint).").unwrap();
+	let w = report::warnings(t, warnings);
+	if !w.is_empty() {
+		writeln!(s).unwrap();
+		s.push_str(&w);
+	}
+	s
+}
+
+fn names(plans: &[&LayerPlan]) -> String {
+	if plans.is_empty() {
+		"none".to_string()
+	} else {
+		plans.iter().map(|p| p.file_name.as_str()).collect::<Vec<_>>().join(", ")
+	}
+}
+
+/// Everything the user needs after a failure in the middle of a layer.
+fn failure_report(dir: &Path, p: &LayerPlan, stages: &[Stage], done: &[&LayerPlan], pending: &[&LayerPlan], keep_originals: bool) -> String {
+	let mut s = String::new();
+	writeln!(s).unwrap();
+	writeln!(s, "COMPACTION STOPPED in layer {} ({}).", p.file_name, p.label).unwrap();
+	let originals = if keep_originals { "kept as .old" } else { "deleted" };
+	writeln!(s, "Layers completed before it (compacted, verified, in place; originals {originals}): {}", names(done)).unwrap();
+	writeln!(s, "Layers not started (untouched): {}", names(pending)).unwrap();
+	writeln!(s, "State of the extents of {}:", p.file_name).unwrap();
+	s.push_str(&describe_state(dir, p, stages));
+	let missing: Vec<&str> = p.extents.iter().filter(|x| !matches!(dir.join(&x.file).try_exists(), Ok(true))).map(|x| x.file.as_str()).collect();
+	if missing.is_empty() {
+		writeln!(s, "Every extent of this layer is present under its own name, so the disk chain is complete.").unwrap();
+	} else {
+		writeln!(s, "MISSING under their own names (the disk chain is broken until restored): {}", missing.join(", ")).unwrap();
+	}
+	let leftovers = find_leftovers(dir).unwrap_or_default();
+	if leftovers.is_empty() {
+		writeln!(s, "No .compact or .old files exist; nothing of this layer was changed. Fix the cause and run compact again.").unwrap();
+		return s;
+	}
+	writeln!(s, "Every file is left exactly as listed; nothing else was changed. Do not start the VM until this is resolved.").unwrap();
+	writeln!(s, "To put this layer back in its original state:").unwrap();
+	writeln!(s, "  vmdk_tree_compact compact \"{}\" --resume          lists the restore actions, changes nothing", dir.display()).unwrap();
+	writeln!(s, "  vmdk_tree_compact compact \"{}\" --resume --yes    restores, then re-analyses and compacts again", dir.display()).unwrap();
+	writeln!(s, "Restoring means: delete every <extent>{COMPACT_SUFFIX}, and rename every <extent>{OLD_SUFFIX} back to <extent>,").unwrap();
+	writeln!(s, "replacing the compacted copy of the same name where there is one. Leftovers now: {}", leftovers.join(", ")).unwrap();
+	if keep_originals && !done.is_empty() {
+		writeln!(s, "Note: with --keep-originals, --resume also restores the .old files of the completed layers, rolling them back").unwrap();
+		writeln!(s, "(safe: they are compacted again by the same run).").unwrap();
+	}
+	s
+}
+
+/// The `compact` subcommand.
+pub fn run(dir: &Path, o: &Options) -> Result<()> {
+	run_with(dir, o, &ntfs_scan)
+}
+
+/// `compact` with the file system scan injected (tests feed fake free maps).
+pub fn run_with(dir: &Path, o: &Options, scan: &dyn Fn(&Tree) -> Result<Vec<NodeScan>>) -> Result<()> {
+	let started = Instant::now();
+	let left = find_leftovers(dir)?;
+	if !left.is_empty() {
+		ensure!(
+			o.resume,
+			"{} holds leftovers of an interrupted compaction: {}\nRun `compact` with --resume to list how they would be restored, and with --resume --yes to restore them and compact again.",
+			dir.display(),
+			left.join(", ")
+		);
+		let actions = plan_restore(dir, &left)?;
+		println!("Leftovers of an interrupted run (--resume):");
+		for a in &actions {
+			println!("  {}", a.describe());
+		}
+		if !o.yes {
+			println!();
+			println!("Nothing was changed (no --yes). Run with --resume --yes to restore these, then re-analyse and compact.");
+			return Ok(());
+		}
+		apply_restore(dir, &actions)?;
+		let still = find_leftovers(dir)?;
+		ensure!(still.is_empty(), "leftovers remain after restoring: {}", still.join(", "));
+		println!("Restored.");
+		println!();
+	} else if o.resume {
+		println!("--resume: no leftovers of an interrupted run.");
+		println!();
+	}
+
+	// Preconditions and a fresh analysis in this process, right before writing.
+	check_no_locks(dir)?;
+	let t = Tree::load(dir)?;
+	let scans = scan(&t)?;
+	ensure!(scans.len() == t.len(), "file system scan covers {} nodes, the tree has {}", scans.len(), t.len());
+	let alloc: Vec<Bitset> = t.nodes.iter().map(|n| n.layer.alloc.clone()).collect();
+	let free: Vec<Bitset> = scans.iter().map(|s| s.free.clone()).collect();
+	let (parents, children) = (t.parents(), t.children());
+	let reclaim = analysis::analyze(&parents, &children, &alloc, &free)?;
+	let selected = resolve_layers(&t, &o.layers)?;
+	let plans = t.preorder().into_iter().map(|(n, d)| LayerPlan::new(&t, n, d, &reclaim[n], selected[n])).collect::<Result<Vec<_>>>()?;
+	let (needed, basis) = space_needed(&plans, o.keep_originals);
+	let space = Space { available: free_space(dir)?, needed, basis };
+	let warnings: Vec<String> = scans.iter().flat_map(|s| s.warnings.iter().cloned()).collect();
+	print!("{}", plan_report(&t, &plans, o, &space, &warnings));
+	ensure!(space.available >= space.needed, "not enough free space: {} bytes available, {} bytes needed", space.available, space.needed);
+	let todo: Vec<&LayerPlan> = plans.iter().filter(|p| p.will_write()).collect();
+	if !o.yes {
+		println!();
+		println!("Plan only: nothing was written. Re-run with --yes to compact.");
+		return Ok(());
+	}
+	if todo.is_empty() {
+		println!();
+		println!("Nothing to compact.");
+		return Ok(());
+	}
+
+	let names_before: Vec<String> = t.nodes.iter().map(|n| n.layer.file_name.clone()).collect();
+	let bytes_before: u64 = t.nodes.iter().map(|n| n.layer.on_disk_bytes).sum();
+	let summaries: Vec<FsSummary> = scans.into_iter().map(|s| s.summary).collect();
+	// Close every extent: an original deleted while a handle is open keeps its space until the handle closes.
+	drop(t);
+
+	println!();
+	println!("Compacting {} layers", todo.len());
+	for (k, p) in todo.iter().enumerate() {
+		let t0 = Instant::now();
+		let mut stages = vec![Stage::Untouched; p.extents.len()];
+		let available = free_space(dir)?;
+		if available < p.new_bytes() + MARGIN {
+			eprint!("{}", failure_report(dir, p, &stages, &todo[..k], &todo[k + 1..], o.keep_originals));
+			bail!("not enough free space for {}: {available} bytes available, {} bytes needed", p.file_name, p.new_bytes() + MARGIN);
+		}
+		eprintln!("[{}/{}] {} ({}): {} extents", k + 1, todo.len(), p.file_name, p.label, p.extents.len());
+		if let Err(e) = compact_layer(dir, p, o.keep_originals, &mut stages, &mut |_, _| Ok(())) {
+			eprint!("{}", failure_report(dir, p, &stages, &todo[..k], &todo[k + 1..], o.keep_originals));
+			return Err(e.context(format!("compacting layer {}", p.file_name)));
+		}
+		println!(
+			"[{:>2}/{}] {} ({}): {} -> {} bytes, freed {} bytes ({}); {} extents verified and replaced, originals {}; {:.1} s",
+			k + 1,
+			todo.len(),
+			p.file_name,
+			p.label,
+			p.orig_bytes(),
+			p.new_bytes(),
+			p.orig_bytes() - p.new_bytes(),
+			size(p.orig_bytes() - p.new_bytes()),
+			p.extents.len(),
+			if o.keep_originals { "kept as .old" } else { "deleted" },
+			t0.elapsed().as_secs_f64()
+		);
+	}
+
+	// Re-analysis of the compacted tree in this process.
+	let t2 = Tree::load(dir).context("re-loading the compacted tree")?;
+	let names_after: Vec<String> = t2.nodes.iter().map(|n| n.layer.file_name.clone()).collect();
+	ensure!(names_after == names_before, "the set of layers changed during compaction");
+	ensure!(t2.parents() == parents, "the tree structure changed during compaction");
+	let scans2 = scan(&t2).context("file system checks on the compacted tree")?;
+	ensure!(scans2.len() == t2.len(), "file system scan covers {} nodes, the tree has {}", scans2.len(), t2.len());
+	for (n, (before, after)) in summaries.iter().zip(&scans2).enumerate() {
+		if let Some(d) = after.summary.difference(before) {
+			bail!("node {} ({}): file system summary changed by compaction: {d}", t2.nodes[n].layer.file_name, t2.label(n));
+		}
+	}
+	let alloc2: Vec<Bitset> = t2.nodes.iter().map(|n| n.layer.alloc.clone()).collect();
+	let free2: Vec<Bitset> = scans2.iter().map(|s| s.free.clone()).collect();
+	let reclaim2 = analysis::analyze(&parents, &children, &alloc2, &free2)?;
+	let mut applied: Vec<Bitset> = alloc.iter().map(|a| Bitset::new(a.len())).collect();
+	for p in &todo {
+		applied[p.node] = p.reclaim.clone();
+	}
+	analysis::verify_reclaim(&parents, &alloc, &free, &applied)?;
+	let mut expected_left = 0u64;
+	for n in 0..t2.len() {
+		let mut want = alloc[n].clone();
+		want.and_not_assign(&applied[n]);
+		ensure!(alloc2[n] == want, "{}: allocated grains after compaction are not the ones planned", t2.nodes[n].layer.file_name);
+		let mut want = reclaim[n].clone();
+		want.and_not_assign(&applied[n]);
+		ensure!(reclaim2[n] == want, "{}: reclaimable grains after compaction are not the expected ones", t2.nodes[n].layer.file_name);
+		expected_left += want.count();
+	}
+	let left_now: u64 = reclaim2.iter().map(|r| r.count()).sum();
+	let bytes_after: u64 = t2.nodes.iter().map(|n| n.layer.on_disk_bytes).sum();
+
+	println!();
+	println!("Re-analysis of the compacted tree (same process):");
+	println!("  - every layer opened and validated; the tree structure and layer set are unchanged;");
+	println!("  - file system summaries identical to before at all {} nodes (partitions, NTFS geometry, $Bitmap bytes,", t2.len());
+	println!("    MFT cross-check, free grains);");
+	println!("  - every layer holds exactly its grains from before minus the dropped ones;");
+	println!("  - every grain in use at any node is served by the same layer as before (kept grains verified byte for byte);");
+	println!("  - reclaimable grains now: {left_now} (expected {expected_left}).");
+	println!();
+	println!("Extent files before: {bytes_before} bytes ({})", size(bytes_before));
+	println!("Extent files after : {bytes_after} bytes ({})", size(bytes_after));
+	println!("Freed              : {} bytes ({})", bytes_before - bytes_after, size(bytes_before - bytes_after));
+	println!("Wall-clock time    : {:.1} s", started.elapsed().as_secs_f64());
+	println!();
+	print!("{}", report::tree_report(&t2));
+	Ok(())
 }
 
 #[cfg(test)]
@@ -841,5 +1411,181 @@ pub(crate) mod tests {
 		h2.descriptor_size = 1;
 		assert!(MetaLayout::parse(&h2, meta).is_err());
 		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn resume_restores_originals_after_replacement() {
+		let dir = build_vm("resume_old", 31);
+		let t = Tree::load(&dir).unwrap();
+		let reclaim = analyze_fake(&t, &fake_free(&t, &mut Rng(32)));
+		let plan = LayerPlan::new(&t, t.root, 0, &reclaim[t.root], true).unwrap();
+		drop(t);
+		let before = files(&dir);
+		let mut stages = vec![Stage::Untouched; plan.extents.len()];
+		compact_layer(&dir, &plan, true, &mut stages, &mut |_, _| Ok(())).unwrap();
+		assert_eq!(stages, [Stage::OldKept, Stage::OldKept]);
+		assert!(files(&dir)["t-s001.vmdk"] != before["t-s001.vmdk"]);
+		let left = find_leftovers(&dir).unwrap();
+		assert_eq!(left, ["t-s001.vmdk.old", "t-s002.vmdk.old"]);
+		let actions = plan_restore(&dir, &left).unwrap();
+		assert_eq!(
+			actions,
+			[
+				Restore::RestoreOld { old: "t-s001.vmdk.old".into(), target: "t-s001.vmdk".into(), replaces: true },
+				Restore::RestoreOld { old: "t-s002.vmdk.old".into(), target: "t-s002.vmdk".into(), replaces: true },
+			]
+		);
+		apply_restore(&dir, &actions).unwrap();
+		assert!(files(&dir) == before);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn resume_restores_an_interrupted_swap() {
+		let dir = build_vm("resume_swap", 41);
+		let before = files(&dir);
+		// s001 was moved aside and its compacted copy not yet renamed; s002's copy was written only.
+		std::fs::rename(dir.join("t-s001.vmdk"), dir.join("t-s001.vmdk.old")).unwrap();
+		std::fs::write(dir.join("t-s001.vmdk.compact"), b"partial").unwrap();
+		std::fs::write(dir.join("t-s002.vmdk.compact"), b"partial").unwrap();
+		let left = find_leftovers(&dir).unwrap();
+		let actions = plan_restore(&dir, &left).unwrap();
+		assert_eq!(
+			actions,
+			[
+				Restore::DeleteCompact("t-s001.vmdk.compact".into()),
+				Restore::DeleteCompact("t-s002.vmdk.compact".into()),
+				Restore::RestoreOld { old: "t-s001.vmdk.old".into(), target: "t-s001.vmdk".into(), replaces: false },
+			]
+		);
+		apply_restore(&dir, &actions).unwrap();
+		assert!(files(&dir) == before);
+
+		// A .compact that is the only copy of its extent, or an .old that is not a valid extent, is refused.
+		std::fs::rename(dir.join("t-000001-s001.vmdk"), dir.join("t-000001-s001.vmdk.compact")).unwrap();
+		assert!(plan_restore(&dir, &find_leftovers(&dir).unwrap()).is_err());
+		std::fs::rename(dir.join("t-000001-s001.vmdk.compact"), dir.join("t-000001-s001.vmdk")).unwrap();
+		std::fs::write(dir.join("t-000001-s002.vmdk.old"), b"not an extent").unwrap();
+		assert!(plan_restore(&dir, &find_leftovers(&dir).unwrap()).is_err());
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Fake per-node scan with stable free maps (seeded by node index), no file systems.
+	fn fake_scan(t: &Tree) -> Result<Vec<NodeScan>> {
+		Ok((0..t.len())
+			.map(|n| {
+				let mut rng = Rng(1000 + n as u64);
+				let mut free = Bitset::new(t.total_grains as usize);
+				(0..t.total_grains as usize).filter(|_| rng.below(100) < 60).for_each(|g| free.set(g));
+				NodeScan {
+					free: free.clone(),
+					summary: FsSummary { scheme: Scheme::None, partitions: Vec::new(), free, warnings: Vec::new() },
+					warnings: Vec::new(),
+				}
+			})
+			.collect())
+	}
+
+	fn opts(yes: bool, resume: bool, layers: &[&str]) -> Options {
+		Options { yes, keep_originals: false, resume, layers: layers.iter().map(|s| s.to_string()).collect() }
+	}
+
+	#[test]
+	fn compact_command_runs_end_to_end_with_fake_free_maps() {
+		let dir = build_vm("run", 51);
+		let t = Tree::load(&dir).unwrap();
+		let free: Vec<Bitset> = fake_scan(&t).unwrap().into_iter().map(|s| s.free).collect();
+		let gb = t.grain_bytes() as usize;
+		let content: Vec<Vec<u8>> = (0..t.len())
+			.map(|node| {
+				let mut v = vec![0u8; t.capacity_bytes() as usize];
+				ChainView::new(&t, node).read_at(0, &mut v).unwrap();
+				v
+			})
+			.collect();
+		drop(t);
+		let pristine = files(&dir);
+
+		// Plan only: nothing changes.
+		run_with(&dir, &opts(false, false, &[]), &fake_scan).unwrap();
+		assert!(files(&dir) == pristine);
+		assert!(run_with(&dir, &opts(false, false, &["nope.vmdk"]), &fake_scan).is_err());
+
+		// One layer only: its extents change, nothing else does; the run's own re-analysis checks the rest.
+		run_with(&dir, &opts(true, false, &["T-000001.VMDK"]), &fake_scan).unwrap();
+		let after_one = files(&dir);
+		for (name, bytes) in &pristine {
+			assert_eq!(after_one[name] != *bytes, name.starts_with("t-000001-s"), "{name}");
+		}
+
+		// Leftovers block a run unless --resume; --resume without --yes changes nothing.
+		std::fs::write(dir.join("t-s001.vmdk.compact"), b"stale").unwrap();
+		assert!(format!("{:#}", run_with(&dir, &opts(true, false, &[]), &fake_scan).unwrap_err()).contains("leftovers"));
+		run_with(&dir, &opts(false, true, &[]), &fake_scan).unwrap();
+		assert!(dir.join("t-s001.vmdk.compact").exists());
+
+		// The rest, after restoring the leftover.
+		run_with(&dir, &opts(true, true, &[]), &fake_scan).unwrap();
+		assert!(find_leftovers(&dir).unwrap().is_empty());
+		let t2 = Tree::load(&dir).unwrap();
+		for node in 0..t2.len() {
+			let view = ChainView::new(&t2, node);
+			let mut buf = vec![0u8; gb];
+			for g in (0..t2.total_grains as usize).filter(|&g| !free[node].get(g)) {
+				view.read_at((g * gb) as u64, &mut buf).unwrap();
+				assert!(buf[..] == content[node][g * gb..(g + 1) * gb], "node {node} grain {g} changed");
+			}
+		}
+		drop(t2);
+
+		// Nothing left to do.
+		let done = files(&dir);
+		run_with(&dir, &opts(true, false, &[]), &fake_scan).unwrap();
+		assert!(files(&dir) == done);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn reports_free_space() {
+		assert!(free_space(&std::env::temp_dir()).unwrap() > 0);
+	}
+
+	/// Pre-flight against a real VM without touching it: mount the VM directory read-only, set
+	/// VMDK_TREE_COMPACT_REAL_VM to it and VMDK_TREE_COMPACT_OUT to a scratch directory, and optionally
+	/// VMDK_TREE_COMPACT_LAYERS to comma-separated descriptor names (default: the base disk). Writes and
+	/// verifies the compacted extents of those layers into the scratch directory, deleting each after.
+	#[test]
+	#[ignore]
+	fn preflight_on_real_vm() {
+		let Ok(vm) = std::env::var("VMDK_TREE_COMPACT_REAL_VM") else { return };
+		let vm = PathBuf::from(vm);
+		let out = PathBuf::from(std::env::var("VMDK_TREE_COMPACT_OUT").expect("VMDK_TREE_COMPACT_OUT"));
+		let t = Tree::load(&vm).unwrap();
+		let free: Vec<Bitset> = ntfs_scan(&t).unwrap().into_iter().map(|s| s.free).collect();
+		let reclaim = analyze_fake(&t, &free);
+		let nodes: Vec<usize> = match std::env::var("VMDK_TREE_COMPACT_LAYERS") {
+			Ok(names) => names.split(',').map(|n| t.nodes.iter().position(|nd| nd.layer.file_name == n).expect(n)).collect(),
+			Err(_) => vec![t.root],
+		};
+		for node in nodes {
+			let plan = LayerPlan::new(&t, node, 0, &reclaim[node], true).unwrap();
+			let start = std::time::Instant::now();
+			for x in &plan.extents {
+				let orig = SparseExtent::open(&vm.join(&x.file)).unwrap();
+				let r = plan.reclaim.slice(x.start_grain as usize, x.grains as usize);
+				let dst = out.join(format!("{}{COMPACT_SUFFIX}", x.file));
+				let _ = std::fs::remove_file(&dst);
+				let w = write_extent(&orig, &r, &dst).unwrap();
+				assert_eq!((w.len, w.data_grains), (x.new_len, x.kept_data), "{}", x.file);
+				let v = verify_extent(&orig, &r, &dst).unwrap();
+				assert!(v.gtes == w.gtes && v.len == w.len);
+				let mut a = [0u8; 512];
+				orig.read_raw(0, &mut a).unwrap();
+				assert!(std::fs::read(&dst).unwrap()[..512] == a[..], "{}: header sector differs", x.file);
+				eprintln!("{}: {} -> {} bytes, {} kept, {} dropped: written and verified", x.file, x.orig_len, w.len, w.data_grains, x.dropped_data);
+				std::fs::remove_file(&dst).unwrap();
+			}
+			eprintln!("{}: {} -> {} bytes in {:.1} s", plan.file_name, plan.orig_bytes(), plan.new_bytes(), start.elapsed().as_secs_f64());
+		}
 	}
 }

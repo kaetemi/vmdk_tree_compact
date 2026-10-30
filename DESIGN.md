@@ -94,7 +94,7 @@ non-zero on any parse failure; never guess.
 Rust 2021, single binary crate `vmdk_tree_compact`. Dependencies: `anyhow`, `clap` (derive).
 Modules: `descriptor`, `sparse`, `layer` (descriptor + extents → grain bitset + reads),
 `tree` (vmsd/vmx + chain building), `view` (chain-view reader), `partition` (MBR/GPT),
-`ntfs`, `analysis`, `report`, `main`. Positioned reads via `FileExt::seek_read` (Windows)
+`ntfs`, `analysis`, `compact` (phase 2 writer, verifier, swap, resume), `report`, `main`. Positioned reads via `FileExt::seek_read` (Windows)
 and `FileExt::read_at` (Unix). `rustfmt.toml`: `hard_tabs = true`, `max_width = 160`,
 `use_small_heuristics = "Max"`. Unit tests for the sparse header parser, descriptor parser,
 NTFS fixups/run-list decoding, and the reclaim algorithm on a synthetic 3-layer tree.
