@@ -181,3 +181,70 @@ pub fn tree_report(t: &Tree) -> String {
 	}
 	s
 }
+
+fn scheme_name(s: crate::partition::Scheme) -> &'static str {
+	match s {
+		crate::partition::Scheme::None => "none (no 55aa signature at LBA 0)",
+		crate::partition::Scheme::Mbr => "MBR",
+		crate::partition::Scheme::Gpt => "GPT",
+		crate::partition::Scheme::Superfloppy => "none (NTFS volume at LBA 0)",
+	}
+}
+
+pub fn ntfs_report(t: &Tree, fs: &[crate::ntfs::NodeFs]) -> String {
+	let gb = t.grain_bytes();
+	let mut s = header(t);
+	let mut extra = Vec::new();
+	for (n, depth) in t.preorder() {
+		let f = &fs[n];
+		let pad = "  ".repeat(depth);
+		writeln!(s).unwrap();
+		writeln!(s, "{pad}{} [{}]", t.nodes[n].layer.file_name, t.label(n)).unwrap();
+		writeln!(s, "{pad}  partition table: {}", scheme_name(f.table.scheme)).unwrap();
+		for p in &f.partitions {
+			let pp = &p.partition;
+			writeln!(s, "{pad}  #{} {}, LBA {} + {} sectors ({})", pp.number, pp.kind, pp.start_lba, pp.sectors, size(pp.size())).unwrap();
+			match &p.volume {
+				None => writeln!(s, "{pad}     not NTFS: treated as in use").unwrap(),
+				Some(v) => {
+					let b = &v.boot;
+					writeln!(
+						s,
+						"{pad}     NTFS {}.{}, serial {:016x}, {} B/sector, {} clusters of {}, MFT at LCN {}, MFTMirr at LCN {}, {} records{}",
+						v.ntfs_version.0,
+						v.ntfs_version.1,
+						b.serial,
+						b.bytes_per_sector,
+						v.clusters(),
+						unit(v.cluster_bytes()),
+						b.mft_lcn,
+						b.mftmirr_lcn,
+						unit(b.record_size),
+						if v.mft_has_attribute_list { ", $MFT has an attribute list" } else { "" }
+					)
+					.unwrap();
+					writeln!(
+						s,
+						"{pad}     $Bitmap: {} bytes; volume {} ({} bytes), used {}, free {} ({} bytes); {}",
+						v.bitmap_data_size,
+						size(v.total_bytes()),
+						v.total_bytes(),
+						size(v.used_clusters * v.cluster_bytes()),
+						size(v.free_bytes()),
+						v.free_bytes(),
+						v.state()
+					)
+					.unwrap();
+				}
+			}
+		}
+		writeln!(s, "{pad}  free grains at this node: {} = {} ({} bytes)", f.free.count(), size(f.free.count() * gb), f.free.count() * gb).unwrap();
+		extra.extend(f.warnings.iter().map(|w| format!("{} [{}]: {w}", t.nodes[n].layer.file_name, t.label(n))));
+	}
+	let w = warnings(t, &extra);
+	if !w.is_empty() {
+		writeln!(s).unwrap();
+		s.push_str(&w);
+	}
+	s
+}

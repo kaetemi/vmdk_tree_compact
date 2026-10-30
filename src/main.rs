@@ -6,9 +6,12 @@ mod analysis;
 mod descriptor;
 mod io;
 mod layer;
+mod ntfs;
+mod partition;
 mod report;
 mod sparse;
 mod tree;
+mod view;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -29,6 +32,11 @@ enum Command {
 		/// VM directory containing the .vmx, .vmsd and .vmdk files.
 		dir: PathBuf,
 	},
+	/// Print per node: partitions, NTFS volume geometry, and total/free bytes according to $Bitmap.
+	Ntfs {
+		/// VM directory containing the .vmx, .vmsd and .vmdk files.
+		dir: PathBuf,
+	},
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -36,6 +44,11 @@ fn run(cli: Cli) -> Result<()> {
 		Command::Tree { dir } => {
 			let t = tree::Tree::load(&dir)?;
 			print!("{}", report::tree_report(&t));
+		}
+		Command::Ntfs { dir } => {
+			let t = tree::Tree::load(&dir)?;
+			let fs = ntfs::scan_tree(&t)?;
+			print!("{}", report::ntfs_report(&t, &fs));
 		}
 	}
 	Ok(())

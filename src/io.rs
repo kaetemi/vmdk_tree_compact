@@ -1,6 +1,6 @@
 //! Positioned, read-only file access and little-endian field helpers.
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use std::fs::File;
 
 /// Positioned reads that fill the whole buffer or fail.
@@ -17,7 +17,7 @@ impl ReadAt for File {
 			let at = offset + pos as u64;
 			let n = self.seek_read(&mut buf[pos..], at).with_context(|| format!("reading {} bytes at offset {}", buf.len() - pos, at))?;
 			if n == 0 {
-				bail!("unexpected end of file reading {} bytes at offset {}", buf.len() - pos, at);
+				anyhow::bail!("unexpected end of file reading {} bytes at offset {}", buf.len() - pos, at);
 			}
 			pos += n;
 		}
