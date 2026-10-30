@@ -91,6 +91,11 @@ Plain `cargo build --release` works on any platform with Rust; the only dependen
 `ryzombuild_xplat_tools` Docker image from the Ryzom Core quick start (cargo-xwin), producing a
 Windows MSVC and a static Linux musl binary; pass `test` to run the tests first.
 
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo fmt --check`, the tests and a release build
+on Ubuntu (static x86_64 musl) and Windows (x86_64 MSVC) for every push, and uploads each binary
+with the README, license and design notes as a `.tar.gz` or `.zip` plus a SHA-256 file. Pushing a
+`v*` tag attaches those packages to a GitHub release.
+
 ## Safety notes
 
 - Every read is a positioned read on a file opened read-only; the only files ever written are
