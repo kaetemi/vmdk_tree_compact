@@ -2,7 +2,8 @@
 name = "vmdk_tree_compact"
 version = "0.1.0"
 edition = "2021"
-description = "Reclaim space from VMware hosted-sparse VMDK snapshot trees with NTFS volumes (dry-run analyzer)"
+description = "Reclaim the space of deleted files from VMware hosted-sparse VMDK snapshot trees with NTFS guests"
+license = "CC0-1.0"
 publish = false
 
 [dependencies]
