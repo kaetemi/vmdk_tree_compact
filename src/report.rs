@@ -235,6 +235,21 @@ pub fn ntfs_report(t: &Tree, fs: &[crate::ntfs::NodeFs]) -> String {
 						v.state()
 					)
 					.unwrap();
+					let m = &v.mft_check;
+					writeln!(
+						s,
+						"{pad}     MFT cross-check: {} records, {} in use, {} blank{}; {} clusters referenced, all marked in use; {} in-use clusters unreferenced ({}); {} cross-linked; {} unreadable records",
+						m.records,
+						m.in_use,
+						m.blank,
+						if m.partial { " (PARTIAL: $MFT continues behind an attribute list)" } else { "" },
+						m.referenced_clusters,
+						m.unreferenced_in_use,
+						size(m.unreferenced_in_use * v.cluster_bytes()),
+						m.cross_linked,
+						m.unreadable
+					)
+					.unwrap();
 				}
 			}
 		}
@@ -247,4 +262,147 @@ pub fn ntfs_report(t: &Tree, fs: &[crate::ntfs::NodeFs]) -> String {
 		s.push_str(&w);
 	}
 	s
+}
+
+pub fn analyze_report(t: &Tree, fs: &[crate::ntfs::NodeFs], reclaim: &[crate::analysis::Bitset], zero: Option<&[crate::analysis::Bitset]>) -> String {
+	let gb = t.grain_bytes();
+	let mut s = header(t);
+	writeln!(s, "Mode         : dry run, read-only; nothing was written").unwrap();
+
+	writeln!(s).unwrap();
+	writeln!(s, "NTFS free space per node ($Bitmap read through each node's chain view)").unwrap();
+	let mut nt = Table::new(&[
+		("Node", false),
+		("Snapshot", false),
+		("Volume", false),
+		("Cluster", true),
+		("Size", true),
+		("Used", true),
+		("Free", true),
+		("Free grains", true),
+		("Used, no MFT ref", true),
+		("State", false),
+	]);
+	let mut extra = Vec::new();
+	for (n, depth) in t.preorder() {
+		let f = &fs[n];
+		let free_grains = size(f.free.count() * gb);
+		let mut first = true;
+		for (p, v) in f.volumes() {
+			let (name, label, fg) = if first { (indent_name(depth, &t.nodes[n].layer.file_name), t.label(n), free_grains.clone()) } else { Default::default() };
+			first = false;
+			nt.row(vec![
+				name,
+				label,
+				format!("#{} @ LBA {}", p.number, p.start_lba),
+				unit(v.cluster_bytes()),
+				size(v.total_bytes()),
+				size(v.used_clusters * v.cluster_bytes()),
+				size(v.free_bytes()),
+				fg,
+				size(v.mft_check.unreferenced_in_use * v.cluster_bytes()),
+				v.state(),
+			]);
+		}
+		if first {
+			nt.row(vec![
+				indent_name(depth, &t.nodes[n].layer.file_name),
+				t.label(n),
+				"no NTFS volume".into(),
+				String::new(),
+				String::new(),
+				String::new(),
+				String::new(),
+				free_grains,
+				String::new(),
+				String::new(),
+			]);
+		}
+		extra.extend(f.warnings.iter().map(|w| format!("{} [{}]: {w}", t.nodes[n].layer.file_name, t.label(n))));
+	}
+	s.push_str(&nt.render());
+
+	writeln!(s).unwrap();
+	writeln!(s, "Reclaimable space per layer (grains every node that can see them has free in NTFS)").unwrap();
+	let mut cols = vec![
+		("Layer", false),
+		("Snapshot", false),
+		("Alloc grains", true),
+		("Allocated", true),
+		("Recl grains", true),
+		("Reclaimable", true),
+		("Recl %", true),
+		("On disk", true),
+		("Est. after", true),
+	];
+	if zero.is_some() {
+		cols.extend([("Zero grains", true), ("Zero", true), ("Zero, not recl", true)]);
+	}
+	let mut tab = Table::new(&cols);
+	let (mut ta, mut tr, mut td, mut tz, mut tzn) = (0u64, 0u64, 0u64, 0u64, 0u64);
+	for (n, depth) in t.preorder() {
+		let l = &t.nodes[n].layer;
+		let a = l.allocated_grains();
+		let r = reclaim[n].count();
+		ta += a;
+		tr += r;
+		td += l.on_disk_bytes;
+		let mut row = vec![
+			indent_name(depth, &l.file_name),
+			t.label(n),
+			a.to_string(),
+			size(a * gb),
+			r.to_string(),
+			size(r * gb),
+			percent(r, a),
+			size(l.on_disk_bytes),
+			size(l.on_disk_bytes - reclaim_data_bytes(l, &reclaim[n])),
+		];
+		if let Some(z) = zero {
+			let zc = z[n].count();
+			let mut zn = z[n].clone();
+			zn.and_not_assign(&reclaim[n]);
+			let znc = zn.count();
+			tz += zc;
+			tzn += znc;
+			row.extend([zc.to_string(), size(zc * gb), size(znc * gb)]);
+		}
+		tab.row(row);
+	}
+	let recl_data: u64 = t.nodes.iter().zip(reclaim).map(|(nd, r)| reclaim_data_bytes(&nd.layer, r)).sum();
+	tab.rule();
+	let mut row =
+		vec!["Total".into(), String::new(), ta.to_string(), size(ta * gb), tr.to_string(), size(tr * gb), percent(tr, ta), size(td), size(td - recl_data)];
+	if zero.is_some() {
+		row.extend([tz.to_string(), size(tz * gb), size(tzn * gb)]);
+	}
+	tab.row(row);
+	s.push_str(&tab.render());
+
+	writeln!(s).unwrap();
+	writeln!(s, "Exact totals").unwrap();
+	writeln!(s, "  Allocated grains   : {ta} = {} bytes", ta * gb).unwrap();
+	writeln!(s, "  Reclaimable grains : {tr} = {} bytes ({} of allocated)", tr * gb, percent(tr, ta)).unwrap();
+	writeln!(s, "  Remaining grains   : {} = {} bytes", ta - tr, (ta - tr) * gb).unwrap();
+	writeln!(s, "  Extent files now   : {td} bytes; estimated after compaction {} bytes (grain data removed, metadata as is)", td - recl_data).unwrap();
+	if zero.is_some() {
+		writeln!(s, "  All-zero grains    : {tz} = {} bytes, of which {tzn} = {} bytes are not already reclaimable", tz * gb, tzn * gb).unwrap();
+		writeln!(s, "                       (informational: a zero grain in a delta masks its parent, so it is not droppable by itself)").unwrap();
+	}
+	writeln!(s).unwrap();
+	writeln!(s, "Checks passed:").unwrap();
+	writeln!(s, "  - at every node, every cluster referenced by an in-use MFT record is marked in use in $Bitmap;").unwrap();
+	writeln!(s, "  - reclaim computed per DESIGN.md and by an independent per-node provider walk: identical;").unwrap();
+	writeln!(s, "  - dropping all reclaimable grains at once leaves every grain in use at any node served by the same layer.").unwrap();
+	let w = warnings(t, &extra);
+	if !w.is_empty() {
+		writeln!(s).unwrap();
+		s.push_str(&w);
+	}
+	s
+}
+
+/// Bytes of grain data (excluding zero-grain GTEs, which occupy nothing) among `grains` of layer `l`.
+fn reclaim_data_bytes(l: &crate::layer::Layer, grains: &crate::analysis::Bitset) -> u64 {
+	grains.iter_ones().filter(|&g| !l.is_zero_grain(g as u64)).count() as u64 * l.grain_bytes()
 }

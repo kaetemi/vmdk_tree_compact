@@ -292,7 +292,13 @@ impl Tree {
 				l.grain_sectors,
 				base.grain_sectors
 			);
-			ensure!(l.capacity_sectors() == extent_sectors.iter().sum::<u64>(), "{}: capacity mismatch", l.file_name);
+			ensure!(
+				l.capacity_sectors() == l.desc.capacity_sectors() && l.capacity_sectors() == extent_sectors.iter().sum::<u64>(),
+				"{}: capacity {} does not match the descriptor sum {}",
+				l.file_name,
+				l.capacity_sectors(),
+				l.desc.capacity_sectors()
+			);
 		}
 		let grain_sectors = base.grain_sectors;
 		let total_grains = base.total_grains;

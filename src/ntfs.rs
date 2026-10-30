@@ -331,6 +331,113 @@ pub struct Volume {
 	pub bitmap: Vec<u8>,
 	pub bitmap_data_size: u64,
 	pub used_clusters: u64,
+	pub mft_check: MftCheck,
+}
+
+/// Result of checking every in-use MFT record's run lists against `$Bitmap`.
+#[derive(Debug, Clone, Default)]
+pub struct MftCheck {
+	/// Records examined (the part of $MFT mapped by its base record).
+	pub records: u64,
+	/// In-use records (base and extension) whose non-resident runs were checked.
+	pub in_use: u64,
+	/// Records that are neither all-zero nor carry the FILE magic (e.g. BAAD); not checked.
+	pub unreadable: u64,
+	/// Never-formatted records: all zero, or zero apart from an update sequence number at offset 0
+	/// repeated at every sector tail (a zero buffer written with multi-sector protection).
+	pub blank: u64,
+	/// The first few unreadable records: (record number, first 8 bytes).
+	pub unreadable_examples: Vec<(u64, [u8; 8])>,
+	/// Distinct clusters referenced by in-use records; all of them are marked in use.
+	pub referenced_clusters: u64,
+	/// Clusters referenced more than once.
+	pub cross_linked: u64,
+	/// Clusters marked in use that no in-use record references (kept anyway).
+	pub unreferenced_in_use: u64,
+	/// $MFT continues beyond what its base record maps; records there were not checked.
+	pub partial: bool,
+}
+
+/// True for a record that was never formatted: all zero, or all zero apart from the update
+/// sequence number at offset 0 and its copies in the last two bytes of every 512-byte sector.
+fn is_blank_record(rec: &[u8]) -> bool {
+	let usn = [rec[0], rec[1]];
+	rec.iter().enumerate().all(|(i, &b)| {
+		let in_sector = i % FIXUP_STRIDE;
+		if i < 2 {
+			true
+		} else if in_sector >= FIXUP_STRIDE - 2 {
+			b == usn[in_sector - (FIXUP_STRIDE - 2)]
+		} else {
+			b == 0
+		}
+	})
+}
+
+/// Reads the whole MFT (as mapped by its base record) and checks that every non-sparse run of every
+/// non-resident attribute of every in-use record lies in clusters marked in use. Fails on any
+/// cluster an in-use record references that `$Bitmap` calls free.
+fn mft_crosscheck(ctx: &VolCtx, record_size: u64, mft: &DataStream, bitmap: &[u8]) -> Result<MftCheck> {
+	const CHUNK: u64 = 1 << 20;
+	let valid = mft.data_size.min(mft.initialized_size);
+	let readable = mft.mapped_bytes.min(valid);
+	let n_records = readable / record_size;
+	let mut check = MftCheck { records: n_records, partial: readable < valid, ..Default::default() };
+	let mut referenced = vec![0u8; bitmap.len()];
+	let rs = record_size as usize;
+	let chunk = CHUNK.max(record_size);
+	let mut buf = vec![0u8; chunk as usize];
+	let total = n_records * record_size;
+	let mut start = 0u64;
+	while start < total {
+		let len = chunk.min(total - start) as usize;
+		ctx.read_stream(&mft.runs, start, &mut buf[..len])?;
+		for (k, rec) in buf[..len].chunks_exact_mut(rs).enumerate() {
+			let idx = start / record_size + k as u64;
+			if &rec[0..4] != b"FILE" {
+				if is_blank_record(rec) {
+					check.blank += 1;
+				} else {
+					check.unreadable += 1;
+					if check.unreadable_examples.len() < 4 {
+						check.unreadable_examples.push((idx, rec[0..8].try_into().unwrap()));
+					}
+				}
+				continue;
+			}
+			if le16(rec, 0x16) & MFT_RECORD_IN_USE == 0 {
+				continue;
+			}
+			apply_fixups(rec, b"FILE").with_context(|| format!("in-use MFT record {idx}"))?;
+			let r = parse_record(rec).with_context(|| format!("in-use MFT record {idx}"))?;
+			check.in_use += 1;
+			for a in &r.attrs {
+				let AttrBody::NonResident { runs, .. } = &a.body else { continue };
+				for run in runs {
+					let Some(lcn) = run.lcn else { continue };
+					ensure!(
+						lcn.checked_add(run.len).is_some_and(|e| e <= ctx.clusters),
+						"MFT record {idx} attribute {:#x}: run at LCN {lcn} (+{}) lies outside the volume",
+						a.type_code,
+						run.len
+					);
+					for c in lcn..lcn + run.len {
+						ensure!(bit(bitmap, c), "MFT record {idx} attribute {:#x} uses cluster {c}, which $Bitmap marks free", a.type_code);
+						let (byte, mask) = ((c / 8) as usize, 1u8 << (c % 8));
+						if referenced[byte] & mask != 0 {
+							check.cross_linked += 1;
+						} else {
+							referenced[byte] |= mask;
+							check.referenced_clusters += 1;
+						}
+					}
+				}
+			}
+		}
+		start += len as u64;
+	}
+	check.unreferenced_in_use = (0..ctx.clusters).filter(|&c| bit(bitmap, c) && !bit(&referenced, c)).count() as u64;
+	Ok(check)
 }
 
 struct VolCtx<'a> {
@@ -442,7 +549,10 @@ impl Volume {
 		let lf = system_data(&r2, "$LogFile", cb, clusters)?;
 		let log = log_state(&ctx, &lf).context("$LogFile restart area")?;
 
-		Ok(Self { offset, boot, ntfs_version, volume_flags, log, mft_has_attribute_list, bitmap, bitmap_data_size: bm.data_size, used_clusters })
+		// Every cluster referenced by an in-use MFT record must be marked in use.
+		let mft_check = mft_crosscheck(&ctx, boot.record_size, &mft, &bitmap).context("MFT cross-check")?;
+
+		Ok(Self { offset, boot, ntfs_version, volume_flags, log, mft_has_attribute_list, bitmap, bitmap_data_size: bm.data_size, used_clusters, mft_check })
 	}
 
 	pub fn cluster_bytes(&self) -> u64 {
@@ -603,6 +713,16 @@ pub fn scan_node(disk: &dyn Disk, total_grains: u64, grain_bytes: u64) -> Result
 					v.state()
 				));
 			}
+			let m = &v.mft_check;
+			if m.partial {
+				warnings.push(format!("partition {}: $MFT continues behind an attribute list; only {} records were cross-checked", p.number, m.records));
+			}
+			if m.cross_linked > 0 || m.unreadable > 0 {
+				warnings.push(format!(
+					"partition {}: MFT cross-check found {} cross-linked clusters and {} unreadable records {:02x?} (consider chkdsk in the guest)",
+					p.number, m.cross_linked, m.unreadable, m.unreadable_examples
+				));
+			}
 			Some(v)
 		} else {
 			None
@@ -705,6 +825,25 @@ mod tests {
 		let mut r = record_with_usa(1024, 0x0007, &[[0, 0], [0, 0]]);
 		r[6] = 4;
 		assert!(apply_fixups(&mut r, b"FILE").is_err());
+	}
+
+	#[test]
+	fn recognises_blank_records() {
+		let mut r = vec![0u8; 1024];
+		assert!(is_blank_record(&r));
+		// As found at the tail of the athenaxp MFT: USN 2 at offset 0 and at both sector tails.
+		r[0] = 2;
+		r[0x1fe] = 2;
+		r[0x3fe] = 2;
+		assert!(is_blank_record(&r));
+		r[0x3fe] = 3;
+		assert!(!is_blank_record(&r));
+		r[0x3fe] = 2;
+		r[100] = 1;
+		assert!(!is_blank_record(&r));
+		let mut baad = vec![0u8; 1024];
+		baad[0..4].copy_from_slice(b"BAAD");
+		assert!(!is_blank_record(&baad));
 	}
 
 	#[test]

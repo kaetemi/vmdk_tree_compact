@@ -263,6 +263,18 @@ impl SparseExtent {
 		let offset = gte as u64 * SECTOR_SIZE + within;
 		self.file.read_full_at(offset, buf).with_context(|| format!("reading grain data from {}", self.path.display()))
 	}
+
+	/// Reads raw grain data starting at `sector`; the range must lie after the metadata and inside the file.
+	pub fn read_data(&self, sector: u64, buf: &mut [u8]) -> Result<()> {
+		ensure!(sector >= self.header.overhead, "sector {sector} lies in the metadata area of {}", self.path.display());
+		ensure!(
+			sector * SECTOR_SIZE + buf.len() as u64 <= self.file_len,
+			"read of {} bytes at sector {sector} extends past the end of {}",
+			buf.len(),
+			self.path.display()
+		);
+		self.file.read_full_at(sector * SECTOR_SIZE, buf).with_context(|| format!("reading grain data from {}", self.path.display()))
+	}
 }
 
 #[cfg(test)]
