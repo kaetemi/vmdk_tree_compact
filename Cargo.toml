@@ -1,0 +1,10 @@
+[package]
+name = "vmdk_tree_compact"
+version = "0.1.0"
+edition = "2021"
+description = "Reclaim space from VMware hosted-sparse VMDK snapshot trees with NTFS volumes (dry-run analyzer)"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
