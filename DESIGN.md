@@ -116,3 +116,67 @@ container with `cargo test` (host target). The Windows binary runs natively:
 `compact`: write a new extent set per layer keeping only surviving grains, CID/parentCID
 unchanged, swap in with the VM powered off, verify every node still reads identically outside
 the reclaimed grains.
+
+# Phase 2 — `compact`
+
+Rewrites each layer's sparse extents keeping only the grains the analysis says must stay.
+Descriptors, `.vmsd`, `.vmx`, `.vmsn` are never touched; CID/parentCID stay as they are, so
+VMware sees the same disk chain.
+
+## Preconditions (checked, hard failures)
+
+- No `*.lck` directory or file in the VM directory; `uncleanShutdown` clear in every extent.
+- Analysis re-run in the same process right before writing (never from a saved result).
+- Free space on the target volume ≥ the new size of the largest layer plus 1 GiB margin.
+  The host has about 47 GiB free, so originals cannot all be kept: each layer is replaced as
+  soon as it is verified. A full backup copy exists at `C:\vmware\athenaxp - Copy`.
+
+## Per layer (in any order; each layer is independent because the reclaim set is a fixpoint)
+
+1. Write every extent of the layer to `<extent>.compact` in the same directory: a hosted sparse
+   extent with the **same header fields** (magic, version 1, flags, capacity, grainSize,
+   descriptorOffset/Size = 0, numGTEsPerGT, rgdOffset, gdOffset, overHead) and the same
+   metadata layout (redundant GD + GTs at `rgdOffset`, primary GD + GTs at `gdOffset`, data
+   from `overHead`). Kept grains are copied in logical grain order, packed from `overHead`
+   upward; GTEs for reclaimed and unallocated grains are 0. Grain directory entries keep the
+   same relative layout as the original (all GTs present, in order). `uncleanShutdown` = 0.
+   File length = `overHead` + kept grains × grainSize sectors, exactly like VMware's files.
+   Write with buffered sequential I/O; flush and fsync before verifying.
+2. Verify `<extent>.compact` by re-opening it with the normal reader (so it must pass every
+   validation `tree` applies): the allocated set must equal `alloc(L) & !reclaim(L)` for that
+   extent, every kept grain must be byte-identical to the original, and the header must match
+   the original except `uncleanShutdown`.
+3. Replace: rename `<extent>` → `<extent>.old`, rename `<extent>.compact` → `<extent>`, for all
+   extents of the layer; then delete the `.old` files of this layer. `--keep-originals` keeps
+   the `.old` files instead (only if space allows; the precondition then uses the whole
+   tree's new size).
+4. Print the layer's before/after sizes.
+
+If anything fails mid-layer, stop: leave `.compact` and `.old` files in place and print exactly
+which files are in which state, and how to recover (`.old` → original name). On startup, refuse
+to run if any `.compact` or `.old` file exists in the directory, unless `--resume` is given, in
+which case leftover `.compact` files are deleted and `.old` files are restored first.
+
+## After all layers
+
+- Re-run the full analysis on the compacted tree in the same process. It must report
+  0 reclaimable grains (the simultaneous drop is a fixpoint: a grain L drops is free at every
+  node that newly sees L's parent's copy), all NTFS checks must pass, and the per-node
+  `$Bitmap` summaries must be identical to the ones from before compaction.
+- Print the total bytes freed and the final tree table.
+
+## Options
+
+`compact <dir> [--yes] [--keep-originals] [--resume] [--layer <descriptor>]...`
+Without `--yes` the command prints the plan (per-layer bytes to be freed, free space check)
+and exits without writing. `--layer` restricts to the named layers (still requires the full
+analysis of the tree).
+
+## Tests
+
+A synthetic end-to-end test: build a small 3-layer tree (tiny capacity, e.g. 64 grains of
+64 KiB) as real files in a temp directory with a fake NTFS-free map injected (the analysis
+takes bitsets, so the test can feed free maps directly), run the writer + verifier + replace
+on it, re-open the tree, and check contents per node against the pre-compaction chain view
+for every grain not free at that node. Also test the failure path: a corrupted `.compact`
+must abort without touching originals.
